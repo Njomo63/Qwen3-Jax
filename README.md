@@ -1,0 +1,1 @@
+My aim is to convert the Qwen3 dense models to Jax then use GRPO to finetune the models using Google TPUs. This is a work in progress.
