@@ -9,9 +9,56 @@ import os
 import jax
 import jax.numpy as jnp
 from jax import tree_util, ShapeDtypeStruct
+from jax.sharding import Mesh, NamedSharding, Sharding, PartitionSpec as P
+from jax.experimental import mesh_utils
 from jaxtyping import Array, Float, Bool, Int
 from transformers import PreTrainedTokenizer, AutoTokenizer, AutoConfig
 
+AxisName = str | None
+Axes = tuple[AxisName, ...]
+
+BATCH_AXIS_NAME = "data"
+TENSOR_AXIS_NAME = "model"
+
+@dataclasses.dataclass
+class ShardingRules:
+    """Mapping from logical data axes to physical mesh axes."""
+    vocab_in: AxisName = TENSOR_AXIS_NAME
+    hidden_size: AxisName = None
+    
+    # Attention
+    hidden_attn: AxisName = None
+    embed_attn: AxisName = TENSOR_AXIS_NAME
+    head_dim: AxisName = None
+    
+    # MLP
+    ffw_gate: AxisName = TENSOR_AXIS_NAME
+    ffw_up: AxisName = TENSOR_AXIS_NAME
+    ffw_down: AxisName = TENSOR_AXIS_NAME
+    hidden_gate: AxisName = None
+    hidden_up: AxisName = None
+    hidden_down: AxisName = None
+    
+    # KVCache
+    batch: AxisName = BATCH_AXIS_NAME
+    cache_len: AxisName = None
+    kv_heads: AxisName = TENSOR_AXIS_NAME
+    
+def logical_to_physical(logical: Axes, rules: ShardingRules) -> jax.sharding.PartitionSpec:
+    """Returns how to physically shard a given sequence of 
+    logical array dimensions (i.e. the logical shape of an array).
+    """
+    spec = [getattr(rules, axis) if axis is not None else None for axis in logical]
+    if len(set(spec)) != len(spec):
+        raise ValueError(f"Colliding physical axes from translating logical spec {logical} -> {axes}")
+    return P(*spec)
+
+def logical_to_sharding(logical: Axes, mesh: Mesh, rules: ShardingRules) -> Sharding:
+    """Returns the sharding for a given sequence of logical array dimensions 
+    (i.e. the logical shape of an array).
+    """
+    assert mesh is not None
+    return NamedSharding(mesh, logical_to_physical(logical, rules))    
 
 @tree_util.register_static
 @dataclasses.dataclass(kw_only=True, frozen=True)
@@ -38,6 +85,10 @@ class Config:
     use_sliding_window: bool 
     vocab_size: int 
     dtype: jnp.dtype = jnp.bfloat16
+    
+    # sharding
+    rules: ShardingRules = dataclasses.field(default_factory=ShardingRules)
+    mesh: jax.sharding.Mesh | None = None
 
 def hf_to_jax_config(qwen_config) -> Config:
     _get = lambda x, k, default=None: getattr(x, k, default) if hasattr(x, k) else dict(x).get(k, default)
@@ -83,10 +134,11 @@ def jax_pytree_struct(cls, meta_fields: tuple = ()):
     data_fields = tuple(f for f in all_fields if f not in meta_fields)
     return tree_util.register_dataclass(cls, data_fields=data_fields, meta_fields=meta_fields)
 
-@partial(jax_pytree_struct, meta_fields=("shape", "dtype", "initializer", "metadata"))
+@partial(jax_pytree_struct, meta_fields=("shape", "logical_axes", "dtype", "initializer", "metadata"))
 class ArrayInfo:
     shape: tuple[int, ...]
     dtype: "jnp.dtype"
+    logical_axes: tuple
     initializer: Callable | None = None
     metadata: dict = field(default_factory=dict)
 
@@ -104,25 +156,35 @@ class _Init:
         raise NotImplementedError
 
     @classmethod
+    def shardings(cls, cfg: Config, *args, **kw):
+        abstract = cls.abstract(cfg, *args, **kw)
+        return jax.tree.map(
+            lambda info: logical_to_sharding(info.logical_axes, cfg.mesh, cfg.rules),
+            abstract,
+            is_leaf=is_param,
+        )
+    
+    @classmethod
     def init(cls, key: jax.random.PRNGKey, cfg: Config, *args, **kw):
         """Returns a pytree of randomly-initialized jax.Arrays corresponding to abstract()."""
         abstract = cls.abstract(cfg, *args, **kw)
+        shardings = jax.tree.map(
+            lambda info: logical_to_sharding(info.logical_axes, cfg.mesh, cfg.rules),
+            abstract,
+            is_leaf=is_param,
+        )
 
-        @jax.jit
+        @partial(jax.jit, out_shardings=shardings)
         def _init():
-            num_leaves = len(jax.tree.leaves(abstract, is_leaf=lambda x: isinstance(x, ArrayInfo)))
+            num_leaves = len(jax.tree.leaves(abstract, is_leaf=is_param))
             key_iter = iter(jax.random.split(key, num_leaves))
 
-            def init_leaf(x):
-                if isinstance(x, ArrayInfo):
-                    return x.initializer(next(key_iter), x.shape, x.dtype)
-                return x
-
             return jax.tree.map(
-                init_leaf,
+                lambda info: info.initializer(next(key_iter), info.shape, info.dtype),
                 abstract,
-                is_leaf=lambda x: isinstance(x, ArrayInfo),
+                is_leaf=is_param,
             )
+
         return _init()
     
 @jax_pytree_struct
@@ -136,9 +198,18 @@ class MLPLayer(_Init):
         _init = jax.nn.initializers.truncated_normal(cfg.initializer_range)
         dtype = cfg.dtype
         layer = MLPLayer(
-            gate_proj = ArrayInfo((cfg.hidden_size, cfg.intermediate_size), dtype, _init),
-            up_proj = ArrayInfo((cfg.hidden_size, cfg.intermediate_size), dtype, _init),
-            down_proj = ArrayInfo((cfg.intermediate_size, cfg.hidden_size), dtype, _init),
+            gate_proj = ArrayInfo((cfg.hidden_size, cfg.intermediate_size),
+                                  dtype,
+                                  ("hidden_gate", "ffw_gate"),
+                                  _init),
+            up_proj = ArrayInfo((cfg.hidden_size, cfg.intermediate_size), 
+                                dtype,
+                                ("hidden_up", "ffw_up"),
+                                _init),
+            down_proj = ArrayInfo((cfg.intermediate_size, cfg.hidden_size),
+                                  dtype, 
+                                  ("hidden_down", "ffw_down"),
+                                  _init),
         )
         return layer
     
@@ -159,18 +230,22 @@ class AttentionLayer(_Init):
         layer = AttentionLayer(
             q_proj = ArrayInfo((cfg.hidden_size, cfg.num_attention_heads * cfg.head_dim),
                                dtype,
+                               ("hidden_attn", "embed_attn"),
                                 _init),
             k_proj = ArrayInfo((cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim),
                                dtype, 
+                               ("hidden_attn", "embed_attn"),
                                _init),
             v_proj = ArrayInfo((cfg.hidden_size, cfg.num_key_value_heads * cfg.head_dim),
                                dtype,
+                               ("hidden_attn", "embed_attn"),
                                _init),
             o_proj = ArrayInfo((cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size),
                                dtype, 
+                               ("embed_attn", "hidden_attn"),
                                _init),
-            q_norm = ArrayInfo((cfg.head_dim,), dtype, _norm_init),
-            k_norm = ArrayInfo((cfg.head_dim,), dtype, _norm_init),
+            q_norm = ArrayInfo((cfg.head_dim,), dtype, ("head_dim",), _norm_init),
+            k_norm = ArrayInfo((cfg.head_dim,), dtype, ("head_dim",), _norm_init),
         )
         return layer
     
@@ -188,8 +263,8 @@ class Layer(_Init):
         return Layer(
             mlp = MLPLayer.abstract(cfg),
             attention = AttentionLayer.abstract(cfg),
-            input_layernorm = ArrayInfo((cfg.hidden_size,), dtype, _init),
-            post_attention_layernorm = ArrayInfo((cfg.hidden_size,), dtype, _init)
+            input_layernorm = ArrayInfo((cfg.hidden_size,), dtype, ("hidden_size",), _init),
+            post_attention_layernorm = ArrayInfo((cfg.hidden_size,), dtype, ("hidden_size",), _init)
         )
         
 @jax_pytree_struct
@@ -206,22 +281,24 @@ class Weights(_Init):
             embedding = ArrayInfo(
                 (cfg.vocab_size, cfg.hidden_size),
                 cfg.dtype,
+                ("vocab_in", "hidden_size"),
                 jax.nn.initializers.truncated_normal(cfg.initializer_range)
             ),
             final_norm = ArrayInfo(
                 (cfg.hidden_size,),
                 cfg.dtype,
+                ("hidden_size",),
                 jax.nn.initializers.constant(1.0)
             ),
         )
-    @classmethod
-    def init_placeholder(cls, cfg):
-        abstract = cls.abstract(cfg)
-        return jax.tree.map(
-            lambda info: ShapeDtypeStruct(shape=info.shape, dtype=info.dtype),
-            abstract,
-            is_leaf=is_param,
-        )
+    # @classmethod
+    # def init_placeholder(cls, cfg):
+    #     abstract = cls.abstract(cfg)
+    #     return jax.tree.map(
+    #         lambda info: ShapeDtypeStruct(shape=info.shape, dtype=info.dtype),
+    #         abstract,
+    #         is_leaf=is_param,
+    #     )
 
 @jax_pytree_struct  
 class KVCache(_Init):
@@ -234,9 +311,9 @@ class KVCache(_Init):
         _init = jax.nn.initializers.zeros
         # The cache shape is (batch_size, cache_size, num_heads, head_dim)
         cache_shape = (batch_size, cache_size, cfg.num_key_value_heads, cfg.head_dim)
-        k_cache_info = ArrayInfo(cache_shape, dtype, _init)
-        v_cache_info = ArrayInfo(cache_shape, dtype, _init)
-        end_index_info = ArrayInfo((batch_size,), jnp.int32, _init)
+        k_cache_info = ArrayInfo(cache_shape, dtype, ("batch", "cache_len", "kv_heads", "head_dim"), _init)
+        v_cache_info = ArrayInfo(cache_shape, dtype, ("batch", "cache_len", "kv_heads", "head_dim"), _init)
+        end_index_info = ArrayInfo((batch_size,), jnp.int32, ("batch",), _init)
         
         cache = KVCache(
             k_cache = [k_cache_info for _ in range(cfg.max_window_layers)],
